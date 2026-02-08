@@ -42,7 +42,6 @@ class CerebroDegradacion:
             "Resultado_Analisis_Bateria.csv",                        # Raíz
             os.path.join(os.path.dirname(__file__), "..", "data", "Resultado_Analisis_Bateria.csv"), # Relativo
             os.path.join(os.path.dirname(__file__), "data", "Resultado_Analisis_Bateria.csv"),
-            r"C:\Temp_Analisis\Bateria_Lab_Project\data\Resultado_Analisis_Bateria.csv"
         ]
         
         for ruta in candidatos:
