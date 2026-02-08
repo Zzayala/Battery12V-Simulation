@@ -98,7 +98,6 @@ MACROS_CONFIGURACION = {
 }
 
 R_CONN_PACK = 0.0040 
-R_CONN_PACK = 0.0040 
 
 # ==========================================
 # 3. INTERFAZ GRÁFICA
