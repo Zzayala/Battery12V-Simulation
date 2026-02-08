@@ -99,14 +99,14 @@ class CerebroDegradacion:
             self.df = self.df[self.df['voltage_drop_norm_per_cycle'] < 0.010] 
             self.df = self.df[self.df['capacity_fade_pct'] < 0.005]
 
-            print(f"[IA] ✅ Cerebro cargado: {len(self.df)} perfiles.")
+            print(f"[IA] [OK] Cerebro cargado: {len(self.df)} perfiles.")
             print(f"     - Deg. Cap Media: {self.df['capacity_fade_pct'].mean():.5%}/ciclo")
             print(f"     - Métrica Res. Media: {self.df['voltage_drop_norm_per_cycle'].mean():.6f} V_norm/ciclo")
             
             self.datos_cargados = True
 
         except Exception as e:
-            print(f"[IA] ❌ ERROR CRÍTICO leyendo CSV: {e}")
+            print(f"[IA] [ERROR] ERROR CRÍTICO leyendo CSV: {e}")
 
     def predecir_degradacion(self, c_rate_usuario, temperatura_usuario=25.0, dod_usuario=100.0):
         """

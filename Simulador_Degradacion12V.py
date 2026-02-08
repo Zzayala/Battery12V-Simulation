@@ -131,32 +131,8 @@ def run_simulation(val=None):
     
     if soc_min >= soc_max: soc_min = soc_max - 1
 
-    # --- FUNCIÓN DE RESISTENCIA DINÁMICA (Importada de physics.py) ---
-    def _calcular_resistencia_dinamica(r_base_ohm, soc, temp_c, current_a, t_pulso_s):
-        # 1. TÉRMINO BASE (SOC - "Bañera")
-        factor_soc = 1.0
-        if soc < 10.0:
-            val = (10.0 - soc) / 10.0
-            factor_soc = 1.0 + 0.5 * (val * val)
-        elif soc > 90.0:
-            val = (soc - 90.0) / 10.0
-            factor_soc = 1.0 + 0.2 * (val * val)
-        
-        R_soc = r_base_ohm * factor_soc
-
-        # 2. TÉRMINO ARRHENIUS (TEMPERATURA)
-        temp_k = temp_c + 273.15
-        if temp_k < 200: temp_k = 200.0
-        factor_arrhenius = np.exp(1500.0 * (1.0/temp_k - 1.0/298.15))
-
-        # 3. TÉRMINO BUTLER-VOLMER (CORRIENTE)
-        i_abs = abs(current_a)
-        factor_corriente = 1.0 - 0.15 * (1.0 - np.exp(-0.05 * i_abs))
-
-        # 4. TÉRMINO DINÁMICO (TIEMPO - Polarización)
-        factor_tiempo = 1.0 + 0.3 * (1.0 - np.exp(-t_pulso_s / 5.0))
-
-        return R_soc * factor_arrhenius * factor_corriente * factor_tiempo
+    # --- FUNCIÓN DE RESISTENCIA DINÁMICA (Vectorizada Inline abajo) ---
+    # Se ha eliminado la función python pura para usar operaciones vectoriales NumPy mucho más rápidas.
 
     # 2. Física (Ajustada por SOH)
     # ---------------------------
@@ -186,74 +162,121 @@ def run_simulation(val=None):
     # La dinámica se calculará paso a paso más abajo.
     r_base_envejecida = r_nom_cell / factor_salud
 
-    # 3. Cálculos Eléctricos (Bucle temporal manual para R dinámica)
+    # 3. Cálculos Eléctricos (VECTORIZADO + OPTIMIZADO)
     dt = t_base[1] - t_base[0] if len(t_base)>1 else 0.1
-    
-    # Inicialización de Arrays
     num_steps = len(t_base)
-    soc_t = np.zeros(num_steps)
-    v_pack_t = np.zeros(num_steps)
-    temps = np.zeros(num_steps)
     
-    # Estado Inicial
-    soc_curr = soc_max
-    temp_curr = temp_amb
-    t_pulso = 0.0
-    ah_acum = 0.0
+    # Pre-cálculos vectoriales (Instante t)
+    I_pack = I_base_pack
+    I_cell = I_pack / n_p
+    i_abs = np.abs(I_cell)
     
-    cp = 1000 # Calor específico
+    # 3.1. SOC Vectorizado (Aprox. inicial sin pérdidas p_joule en capacidad, aceptable)
+    ah_step = I_pack * (dt / 3600.0)
+    ah_acum = np.cumsum(ah_step)
+    # SOC al inicio de cada paso (para lookup de OCV y R)
+    soc_vector = soc_max - (np.concatenate(([0.0], ah_acum[:-1])) / cap_celda_real / n_p) * 100.0
+    soc_vector = np.clip(soc_vector, 0.0, 100.0)
 
-    # --- BUCLE DE SIMULACIÓN PASO A PASO ---
-    for i in range(num_steps):
-        I_pack_inst = I_base_pack[i]
-        I_cell_inst = I_pack_inst / n_p
-        
-        # A. Calcular Resistencia Dinámica Instantánea
-        r_dinamica_cell = _calcular_resistencia_dinamica(r_base_envejecida, soc_curr, temp_curr, I_cell_inst, t_pulso)
-        r_pack_total = (r_dinamica_cell * n_s / n_p) + R_CONN_PACK
-        
-        # B. Actualizar Polarización (t_pulso)
-        if abs(I_cell_inst) > 1.0: # Si hay corriente significativa
-            t_pulso += dt
-        else: # Relajación
-            t_pulso = max(0.0, t_pulso - dt * 2.0)
+    # 3.2. Resistencia Base (SOC + Corriente + Tiempo) -> VECTORIZADO
+    # R_soc ("Bañera")
+    factor_soc = np.ones(num_steps)
+    # < 10%
+    mask_low = soc_vector < 10.0
+    val_low = (10.0 - soc_vector[mask_low]) / 10.0
+    factor_soc[mask_low] = 1.0 + 0.5 * (val_low**2)
+    # > 90%
+    mask_high = soc_vector > 90.0
+    val_high = (soc_vector[mask_high] - 90.0) / 10.0
+    factor_soc[mask_high] = 1.0 + 0.2 * (val_high**2)
+    
+    R_soc_base = r_base_envejecida * factor_soc
+
+    # Butler-Volmer
+    factor_corriente = 1.0 - 0.15 * (1.0 - np.exp(-0.05 * i_abs))
+
+    # Polarización (t_pulso) - Bucle rápido (JIT-like)
+    t_pulso = np.zeros(num_steps)
+    tp_curr = 0.0
+    dt_relax = dt * 2.0
+    mask_active = i_abs > 1.0
+    
+    # Este bucle es simple y rápido en python para arrays < 100k
+    for k in range(num_steps):
+        t_pulso[k] = tp_curr
+        if mask_active[k]:
+            tp_curr += dt
+        else:
+            tp_curr -= dt_relax
+            if tp_curr < 0.0: tp_curr = 0.0
             
-        # C. Voltaje OCV
-        ocv_cell = f_ocv_user(np.clip(soc_curr, 0, 100))
-        ocv_pack = ocv_cell * n_s
-        
-        # D. Caída de Tensión y Voltaje Terminal
-        v_drop = I_pack_inst * r_pack_total
-        v_term = ocv_pack - v_drop
-        
-        # E. Actualizar SOC
-        ah_step = I_pack_inst * (dt / 3600.0)
-        ah_acum += ah_step
-        soc_curr = soc_max - (ah_acum / cap_celda_real / n_p) * 100.0
-        
-        # F. Modelo Térmico
-        Q_gen = (I_cell_inst**2) * r_dinamica_cell # Calor generado por celda
-        Q_out = refrigeracion * (temp_curr - temp_amb)
-        dT = ((Q_gen - Q_out) / (mass * cp)) * dt
-        temp_curr += dT
-        
-        # Guardar datos
-        soc_t[i] = soc_curr
-        v_pack_t[i] = v_term
-        temps[i] = temp_curr
-
-    # Post-proceso para compatibilidad con código antiguo
-    ah_consumed = np.cumsum(I_base_pack * (dt / 3600.0)) # Recalculo simple para vectorizar verificaciones
-    soc_t = np.clip(soc_t, 0, 100) # Clamp final
+    factor_tiempo = 1.0 + 0.3 * (1.0 - np.exp(-t_pulso / 5.0))
     
-    # Valores medios para reporte
-    r_operative_cell = np.mean([_calcular_resistencia_dinamica(r_base_envejecida, 50, 40, 20, 10)]) # Valor representativo
+    # Resistencia Parcial (Sin Temperatura)
+    R_partial = R_soc_base * factor_corriente * factor_tiempo
+
+    # 3.3. Bucle Térmico (Recursivo) + Resistencia Final
+    temps = np.zeros(num_steps)
+    temp_curr = temp_amb
+    cp = 1000.0
+    inv_mass_cp = 1.0 / (mass * cp)
+    dt_inv_mass_cp = dt * inv_mass_cp
+    inv_298 = 1.0 / 298.15
+    
+    I_sq_cell = I_cell**2
+    
+    # Bucle térmico optimizado
+    for k in range(num_steps):
+        # Temperatura inicio de paso (usada para R)
+        temp_k = temp_curr + 273.15
+        if temp_k < 200.0: temp_k = 200.0 # Safety clamp
+        
+        # Arrhenius
+        factor_arrhenius = np.exp(1500.0 * (1.0/temp_k - inv_298))
+        
+        # R Dinámica Final del paso
+        r_dyn = R_partial[k] * factor_arrhenius
+        
+        # Calor
+        Q_gen = I_sq_cell[k] * r_dyn
+        Q_out = refrigeracion * (temp_curr - temp_amb)
+        
+        dT = (Q_gen - Q_out) * dt_inv_mass_cp
+        temp_curr += dT
+        temps[k] = temp_curr
+
+    # 3.4. Cálculo Final Voltajes Vectorizado
+    # Recalculamos vector de temperaturas para Arrhenius completo
+    temp_k_vec = temps + 273.15
+    np.clip(temp_k_vec, 200.0, None, out=temp_k_vec)
+    factor_arr_vec = np.exp(1500.0 * (1.0/temp_k_vec - inv_298))
+    
+    r_operative_vec = R_partial * factor_arr_vec
+    r_pack_total_vec = (r_operative_vec * n_s / n_p) + R_CONN_PACK
+    
+    ocv_cell_vec = f_ocv_user(soc_vector) # Scipy interp es vectorizado por defecto? Si.
+    v_pack_ocv = ocv_cell_vec * n_s
+    v_drop = I_pack * r_pack_total_vec
+    v_pack_t = v_pack_ocv - v_drop
+    
+    # Variables finales para plots
+    soc_t = soc_vector
+    
+    # AH Consumidos Total (para validación)
+    ah_consumed_total = ah_acum[-1] if len(ah_acum) > 0 else 0.0
+    
+    # Valor representativo para texto
+    avg_temp = np.mean(temps)
+    avg_soc = 50.0
+    r_rep_base = r_base_envejecida 
+    f_arr_rep = np.exp(1500.0 * (1.0/(avg_temp+273.15) - inv_298))
+    r_operative_cell = r_rep_base * f_arr_rep # Simplificado para display
     
     # 4. ALERTAS DE TENSIÓN
     # (El código siguiente usa v_pack_t que ya calculamos arriba)
     
     p_pack_t = v_pack_t * I_base_pack
-    viable = ah_consumed[-1] <= (cap_pack_ah_real * (soc_max - soc_min) / 100.0)
+    viable = ah_consumed_total <= (cap_pack_ah_real * (soc_max - soc_min) / 100.0)
 
     # 4. ALERTAS DE TENSIÓN
     v_status = "VOLTAJE OK"
@@ -433,7 +456,10 @@ def run_simulation(val=None):
     global txt_res
     try: txt_res.remove()
     except: pass
-    info_res = f"R. Celda (Dinámica): ~{r_operative_cell*1000:.2f} mΩ\nR. Pack (Dinámica):  ~{r_pack_total*1000:.1f} mΩ"
+    
+    # Recalculamos R pack representativa con el último valor vectorial
+    r_pack_total_rep = (r_operative_cell * n_s / n_p) + R_CONN_PACK
+    info_res = f"R. Celda (Dinámica ~{avg_temp:.0f}°C): ~{r_operative_cell*1000:.2f} mΩ\nR. Pack (Dinámica):  ~{r_pack_total_rep*1000:.1f} mΩ"
     txt_res = plt.text(0.05, 0.65, info_res, transform=fig.transFigure, fontsize=10, 
                        fontweight='bold', color='white',
                        bbox=dict(facecolor='#007acc', edgecolor='none', alpha=0.8, boxstyle='round,pad=0.5'))
