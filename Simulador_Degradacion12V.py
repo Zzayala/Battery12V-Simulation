@@ -5,34 +5,77 @@ from matplotlib.ticker import FuncFormatter
 from scipy.interpolate import interp1d
 import os
 
-# --- CORRECCIÓN: Mantenemos el nombre original 'get_absolute_path' ---
-# para no romper las funciones cargar_curva_ocv_usuario y cargar_perfil_solicitaciones
+# ==========================================
+# 0. CONFIGURACIÓN GLOBAL Y MACROS
+# ==========================================
+
+# Variables globales que serán inicializadas en el bloque main
+cerebro_ia = None
+f_ocv_user = None
+t_base = None
+I_base_pack = None
+fig = None
+ax_graph1 = None
+ax_term = None
+ax_soc = None
+controls = []
+graph_mode = 'Tensión (V)'
+txt_res = None
+txt_vida = None
+radio = None
+radio_plot = None
+
+# MACROS DE CONFIGURACIÓN RÁPIDA (Solo mueven sliders)
+MACROS_CONFIGURACION = {
+    '3S2P (80-20)': {'S': 3, 'P': 2, 'S_max': 80, 'S_min': 20},
+    '3S2P (95-35)': {'S': 3, 'P': 2, 'S_max': 95, 'S_min': 35},
+    '4S2P (80-20)': {'S': 4, 'P': 2, 'S_max': 80, 'S_min': 20}
+}
+
+R_CONN_PACK = 0.0040
+
+# ==========================================
+# 1. UTILIDADES Y LÓGICA PURA
+# ==========================================
+
 def get_absolute_path(filename):
     directorio_script = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(directorio_script, filename)
-
-# Importamos tu módulo de IA
-try:
-    from Modulo_Inferencia12V import CerebroDegradacion
-except ImportError:
-    print("ERROR CRÍTICO: No encuentro Modulo_Inferencia.py en la carpeta.")
-
-# --- CARGA DEL CEREBRO ---
-# Usamos la función corregida para encontrar el CSV
-ruta_csv = get_absolute_path("Resultado_Analisis_Bateria.csv")
-print(f"Buscando base de datos en: {ruta_csv}") 
-
-cerebro_ia = CerebroDegradacion(ruta_csv)
-
-# ==========================================
-# 1. LECTORES DE DATOS Y UTILIDADES
-# ==========================================
 
 def time_formatter(x, pos):
     """Formato Cronómetro MM:SS"""
     m = int(x // 60)
     s = int(x % 60)
     return f"{m:02d}:{s:02d}"
+
+def calcular_resistencia_dinamica(r_base_ohm, soc, temp_c, current_a, t_pulso_s):
+    """
+    Calcula la resistencia dinámica de la celda basándose en SOC, Temperatura, Corriente y Tiempo de pulso.
+    """
+    # 1. TÉRMINO BASE (SOC - "Bañera")
+    factor_soc = 1.0
+    if soc < 10.0:
+        val = (10.0 - soc) / 10.0
+        factor_soc = 1.0 + 0.5 * (val * val)
+    elif soc > 90.0:
+        val = (soc - 90.0) / 10.0
+        factor_soc = 1.0 + 0.2 * (val * val)
+
+    R_soc = r_base_ohm * factor_soc
+
+    # 2. TÉRMINO ARRHENIUS (TEMPERATURA)
+    temp_k = temp_c + 273.15
+    if temp_k < 200: temp_k = 200.0
+    factor_arrhenius = np.exp(1500.0 * (1.0/temp_k - 1.0/298.15))
+
+    # 3. TÉRMINO BUTLER-VOLMER (CORRIENTE)
+    i_abs = abs(current_a)
+    factor_corriente = 1.0 - 0.15 * (1.0 - np.exp(-0.05 * i_abs))
+
+    # 4. TÉRMINO DINÁMICO (TIEMPO - Polarización)
+    factor_tiempo = 1.0 + 0.3 * (1.0 - np.exp(-t_pulso_s / 5.0))
+
+    return R_soc * factor_arrhenius * factor_corriente * factor_tiempo
 
 def cargar_curva_ocv_usuario(filename):
     full_path = get_absolute_path(filename)
@@ -76,49 +119,13 @@ def cargar_perfil_solicitaciones(filename):
         return np.array(t_out), np.array(I_out)
     except: return np.linspace(0,1,10), np.zeros(10)
 
-# Carga Inicial
-f_ocv_user = cargar_curva_ocv_usuario("SOC_OCV_datos.txt")
-t_base, I_base_pack = cargar_perfil_solicitaciones("Solicitaciones enduarnce.txt")
-
 # ==========================================
-# 2. CONFIGURACIÓN MODELOS
+# 2. LÓGICA DE SIMULACIÓN Y UI
 # ==========================================
 
-# 1. Base de datos de degradación (Calibrada con Datasheet Grepow GRP7770175)
-# Vida estimada: ~500 ciclos @ 0.5C (Nominal)
-
-# 1. Base de datos de degradación (ELIMINADA - SE USA SOLO IA + FISICA)
-# Vida estimada: ~500 ciclos @ 0.5C (Nominal)
-
-# MACROS DE CONFIGURACIÓN RÁPIDA (Solo mueven sliders)
-MACROS_CONFIGURACION = {
-    '3S2P (80-20)': {'S': 3, 'P': 2, 'S_max': 80, 'S_min': 20},
-    '3S2P (95-35)': {'S': 3, 'P': 2, 'S_max': 95, 'S_min': 35},
-    '4S2P (80-20)': {'S': 4, 'P': 2, 'S_max': 80, 'S_min': 20}
-}
-
-R_CONN_PACK = 0.0040 
-R_CONN_PACK = 0.0040 
-
-# ==========================================
-# 3. INTERFAZ GRÁFICA
-# ==========================================
-fig = plt.figure(figsize=(16, 9))
-plt.subplots_adjust(left=0.45, right=0.95, top=0.95, bottom=0.05, hspace=0.45)
-
-ax_graph1 = plt.subplot(3, 1, 1) 
-ax_term = plt.subplot(3, 1, 2)
-ax_soc = plt.subplot(3, 1, 3)
-
-controls = []
-graph_mode = 'Tensión (V)' 
-txt_res = None
-txt_vida = None
-
-# ==========================================
-# 4. LÓGICA DE SIMULACIÓN
-# ==========================================
 def run_simulation(val=None):
+    global txt_res, txt_vida
+
     # 1. Leer Sliders
     cap_celda = controls[0][0].val
     n_s = int(controls[1][0].val)
@@ -131,33 +138,6 @@ def run_simulation(val=None):
     
     if soc_min >= soc_max: soc_min = soc_max - 1
 
-    # --- FUNCIÓN DE RESISTENCIA DINÁMICA (Importada de physics.py) ---
-    def _calcular_resistencia_dinamica(r_base_ohm, soc, temp_c, current_a, t_pulso_s):
-        # 1. TÉRMINO BASE (SOC - "Bañera")
-        factor_soc = 1.0
-        if soc < 10.0:
-            val = (10.0 - soc) / 10.0
-            factor_soc = 1.0 + 0.5 * (val * val)
-        elif soc > 90.0:
-            val = (soc - 90.0) / 10.0
-            factor_soc = 1.0 + 0.2 * (val * val)
-        
-        R_soc = r_base_ohm * factor_soc
-
-        # 2. TÉRMINO ARRHENIUS (TEMPERATURA)
-        temp_k = temp_c + 273.15
-        if temp_k < 200: temp_k = 200.0
-        factor_arrhenius = np.exp(1500.0 * (1.0/temp_k - 1.0/298.15))
-
-        # 3. TÉRMINO BUTLER-VOLMER (CORRIENTE)
-        i_abs = abs(current_a)
-        factor_corriente = 1.0 - 0.15 * (1.0 - np.exp(-0.05 * i_abs))
-
-        # 4. TÉRMINO DINÁMICO (TIEMPO - Polarización)
-        factor_tiempo = 1.0 + 0.3 * (1.0 - np.exp(-t_pulso_s / 5.0))
-
-        return R_soc * factor_arrhenius * factor_corriente * factor_tiempo
-
     # 2. Física (Ajustada por SOH)
     # ---------------------------
     # Envejecimiento:
@@ -165,8 +145,6 @@ def run_simulation(val=None):
     # 2. Resistencia aumenta. Regla empírica: R ~ 1/SOH (o más agresivo R ~ 1/SOH^2)
     
     factor_salud = soh_simulado_pct / 100.0
-    
-    # Capacidad Real Actual (= Capacidad Nominal * SOH)
     
     # Capacidad Real Actual (= Capacidad Nominal * SOH)
     cap_celda_real = cap_celda * factor_salud
@@ -209,7 +187,7 @@ def run_simulation(val=None):
         I_cell_inst = I_pack_inst / n_p
         
         # A. Calcular Resistencia Dinámica Instantánea
-        r_dinamica_cell = _calcular_resistencia_dinamica(r_base_envejecida, soc_curr, temp_curr, I_cell_inst, t_pulso)
+        r_dinamica_cell = calcular_resistencia_dinamica(r_base_envejecida, soc_curr, temp_curr, I_cell_inst, t_pulso)
         r_pack_total = (r_dinamica_cell * n_s / n_p) + R_CONN_PACK
         
         # B. Actualizar Polarización (t_pulso)
@@ -247,7 +225,7 @@ def run_simulation(val=None):
     soc_t = np.clip(soc_t, 0, 100) # Clamp final
     
     # Valores medios para reporte
-    r_operative_cell = np.mean([_calcular_resistencia_dinamica(r_base_envejecida, 50, 40, 20, 10)]) # Valor representativo
+    r_operative_cell = np.mean([calcular_resistencia_dinamica(r_base_envejecida, 50, 40, 20, 10)]) # Valor representativo
     
     # 4. ALERTAS DE TENSIÓN
     # (El código siguiente usa v_pack_t que ya calculamos arriba)
@@ -323,8 +301,12 @@ def run_simulation(val=None):
     # C) Consulta a la IA -> Obtener "Ancla"
     try:
         tasa_pct_base_100, info_ia = cerebro_ia.predecir_degradacion(c_rate_efectivo, temp_promedio, 100.0)
-    except TypeError:
-        tasa_pct_base_100, info_ia = cerebro_ia.predecir_degradacion(c_rate_efectivo, temp_promedio)
+    except (TypeError, AttributeError):
+        # Fallback if cerebro_ia is None or fails
+        if cerebro_ia:
+             tasa_pct_base_100, info_ia = cerebro_ia.predecir_degradacion(c_rate_efectivo, temp_promedio)
+        else:
+             tasa_pct_base_100 = None
 
     # D) FACTORES FÍSICOS DE CORRECCIÓN
     
@@ -421,7 +403,6 @@ def run_simulation(val=None):
         texto_vida = f"{int(ciclos)} Ciclos"
         
     # Mostrar el valor como texto en la figura
-    global txt_vida
     try: txt_vida.remove()
     except: pass
     
@@ -430,7 +411,6 @@ def run_simulation(val=None):
                        bbox=dict(facecolor='#2ca02c', edgecolor='none', alpha=0.8, boxstyle='round,pad=0.5'))
 
     # TEXTO RESISTENCIAS
-    global txt_res
     try: txt_res.remove()
     except: pass
     info_res = f"R. Celda (Dinámica): ~{r_operative_cell*1000:.2f} mΩ\nR. Pack (Dinámica):  ~{r_pack_total*1000:.1f} mΩ"
@@ -439,15 +419,6 @@ def run_simulation(val=None):
                        bbox=dict(facecolor='#007acc', edgecolor='none', alpha=0.8, boxstyle='round,pad=0.5'))
 
     fig.canvas.draw_idle()
-
-# ==========================================
-# 5. CONTROLES
-# ==========================================
-txt_res = None 
-txt_vida = None 
-
-ax_radio = plt.axes([0.05, 0.70, 0.35, 0.20], facecolor='#f0f0f0')
-radio = RadioButtons(ax_radio, list(MACROS_CONFIGURACION.keys()), active=0)
 
 def aplicar_configuracion(label):
     macro = MACROS_CONFIGURACION[label]
@@ -459,14 +430,10 @@ def aplicar_configuracion(label):
     if 'S_max' in macro: controls[3][0].set_val(macro['S_max'])
     if 'S_min' in macro: controls[4][0].set_val(macro['S_min'])
 
-radio.on_clicked(aplicar_configuracion)
-plt.text(0.05, 0.91, "1. CONFIGURACIÓN RÁPIDA (MACROS)", transform=fig.transFigure, fontsize=11, fontweight='bold', color='blue')
-
-ax_radio_plot = plt.axes([0.25, 0.92, 0.15, 0.06], facecolor='#e6e6e6')
-radio_plot = RadioButtons(ax_radio_plot, ['Tensión (V)', 'Intensidad (A)', 'Potencia (W)'])
-def change_graph(label): global graph_mode; graph_mode = label; run_simulation()
-radio_plot.on_clicked(change_graph)
-plt.text(0.25, 0.985, "VISUALIZACIÓN SUPERIOR", transform=fig.transFigure, fontsize=9, fontweight='bold')
+def change_graph(label):
+    global graph_mode
+    graph_mode = label
+    run_simulation()
 
 def make_control(label, vmin, vmax, vinit, y_pos, step, fmt="%1.0f"):
     plt.text(0.05, y_pos + 0.025, label, transform=fig.transFigure, fontsize=9, fontweight='bold')
@@ -495,17 +462,6 @@ def make_control(label, vmin, vmax, vinit, y_pos, step, fmt="%1.0f"):
     b_plus.on_clicked(inc)
     controls.append([s, b_min, b_plus])
 
-start_y = 0.55; step_y = 0.06
-plt.text(0.05, 0.60, "2. AJUSTE MANUAL", transform=fig.transFigure, fontsize=11, fontweight='bold')
-
-make_control('Capacidad Celda (Ah)', 2.0, 16.0, 10.0, start_y, 0.1, "%1.1f")
-make_control('Series (S)', 1, 6, 3, start_y - step_y, 1)
-make_control('Paralelo (P)', 1, 6, 2, start_y - 2*step_y, 1)
-make_control('SOC Máximo (%)', 60, 100, 80, start_y - 3.5*step_y, 1)
-make_control('SOC Mínimo (%)', 0, 40, 20, start_y - 4.5*step_y, 1)
-make_control('Temp. Ambiente (°C)', 15.0, 65.0, 42.4, start_y - 6*step_y, 0.5, "%1.1f")
-make_control('Refrigeración (W/K)', 0.0, 8.0, 0.3, start_y - 7*step_y, 0.1, "%1.1f")
-
 # Clase Slider Invertido (100 -> Izquierda, 60 -> Derecha)
 class InvertedSlider(Slider):
     def set_val(self, val):
@@ -532,13 +488,62 @@ class InvertedSlider(Slider):
         # Fórmula: valor = v_max - (mouse_x_norm * (v_max - v_min))
         pass
 
-# Re-implementación simple usando Slider estándar pero con lógica invertida en simulación
-# El usuario pide: "100% a la izquierda, 60% a la derecha"
-# Esto significa un slider que va de 100 (min_axis) a 60 (max_axis).
-# Matplotlib permite vmin > vmax? SÍ.
+# ==========================================
+# 3. EJECUCIÓN PRINCIPAL
+# ==========================================
+if __name__ == "__main__":
+    # Importamos tu módulo de IA
+    try:
+        from Modulo_Inferencia12V import CerebroDegradacion
+    except ImportError:
+        print("ERROR CRÍTICO: No encuentro Modulo_Inferencia.py en la carpeta.")
+        CerebroDegradacion = None # Prevent crash if module missing
 
-make_control('SOH Simulado (%)', 60.0, 100.0, 100.0, start_y - 8*step_y, 1, "%1.0f")
+    # --- CARGA DEL CEREBRO ---
+    # Usamos la función corregida para encontrar el CSV
+    ruta_csv = get_absolute_path("Resultado_Analisis_Bateria.csv")
+    print(f"Buscando base de datos en: {ruta_csv}")
 
-aplicar_configuracion('3S2P (80-20)')
-run_simulation()
-plt.show()
+    if CerebroDegradacion:
+        cerebro_ia = CerebroDegradacion(ruta_csv)
+    else:
+        cerebro_ia = None
+
+    # Carga Inicial
+    f_ocv_user = cargar_curva_ocv_usuario("SOC_OCV_datos.txt")
+    t_base, I_base_pack = cargar_perfil_solicitaciones("Solicitaciones enduarnce.txt")
+
+    # INTERFAZ GRÁFICA
+    fig = plt.figure(figsize=(16, 9))
+    plt.subplots_adjust(left=0.45, right=0.95, top=0.95, bottom=0.05, hspace=0.45)
+
+    ax_graph1 = plt.subplot(3, 1, 1)
+    ax_term = plt.subplot(3, 1, 2)
+    ax_soc = plt.subplot(3, 1, 3)
+
+    # Radio Buttons
+    ax_radio = plt.axes([0.05, 0.70, 0.35, 0.20], facecolor='#f0f0f0')
+    radio = RadioButtons(ax_radio, list(MACROS_CONFIGURACION.keys()), active=0)
+    radio.on_clicked(aplicar_configuracion)
+    plt.text(0.05, 0.91, "1. CONFIGURACIÓN RÁPIDA (MACROS)", transform=fig.transFigure, fontsize=11, fontweight='bold', color='blue')
+
+    ax_radio_plot = plt.axes([0.25, 0.92, 0.15, 0.06], facecolor='#e6e6e6')
+    radio_plot = RadioButtons(ax_radio_plot, ['Tensión (V)', 'Intensidad (A)', 'Potencia (W)'])
+    radio_plot.on_clicked(change_graph)
+    plt.text(0.25, 0.985, "VISUALIZACIÓN SUPERIOR", transform=fig.transFigure, fontsize=9, fontweight='bold')
+
+    start_y = 0.55; step_y = 0.06
+    plt.text(0.05, 0.60, "2. AJUSTE MANUAL", transform=fig.transFigure, fontsize=11, fontweight='bold')
+
+    make_control('Capacidad Celda (Ah)', 2.0, 16.0, 10.0, start_y, 0.1, "%1.1f")
+    make_control('Series (S)', 1, 6, 3, start_y - step_y, 1)
+    make_control('Paralelo (P)', 1, 6, 2, start_y - 2*step_y, 1)
+    make_control('SOC Máximo (%)', 60, 100, 80, start_y - 3.5*step_y, 1)
+    make_control('SOC Mínimo (%)', 0, 40, 20, start_y - 4.5*step_y, 1)
+    make_control('Temp. Ambiente (°C)', 15.0, 65.0, 42.4, start_y - 6*step_y, 0.5, "%1.1f")
+    make_control('Refrigeración (W/K)', 0.0, 8.0, 0.3, start_y - 7*step_y, 0.1, "%1.1f")
+    make_control('SOH Simulado (%)', 60.0, 100.0, 100.0, start_y - 8*step_y, 1, "%1.0f")
+
+    aplicar_configuracion('3S2P (80-20)')
+    run_simulation()
+    plt.show()
