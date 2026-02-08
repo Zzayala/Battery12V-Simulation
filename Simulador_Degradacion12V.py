@@ -87,22 +87,14 @@ t_base, I_base_pack = cargar_perfil_solicitaciones("Solicitaciones enduarnce.txt
 # 1. Base de datos de degradación (Calibrada con Datasheet Grepow GRP7770175)
 # Vida estimada: ~500 ciclos @ 0.5C (Nominal)
 
-DB_DEGRADACION_BASE = {
-    0.2:  0.0012,  # Uso suave (> 800 ciclos)
-    0.5:  0.0017,  # Nominal Estándar (~600 ciclos)
-    1.0:  0.0020,  # Muy ligero para esta celda
-    4.0:  0.0025,  # 40A. Zona de confort para High-Discharge (~450-500 ciclos)
-    8.0:  0.0036,  # 80A. Límite Continuo. (Garantía datasheet ~300 ciclos)
-    15.0: 0.0080,  # Zona de estrés alto
-    25.0: 0.0400,  # Cerca del pico de 30C (Degradación severa)
-    40.0: 0.2000   # Fuera de rango (Destructivo)
-}
+# 1. Base de datos de degradación (ELIMINADA - SE USA SOLO IA + FISICA)
+# Vida estimada: ~500 ciclos @ 0.5C (Nominal)
 
-# PRESETS 
-MODELOS_DB = {
-    '3S2P 80-20': {'C': 10.0, 'S': 3, 'P': 2, 'R': 0.0015, 'Mass': 0.205, 'S_max': 80, 'S_min': 20},
-    '3S2P 95-35': {'C': 10.0, 'S': 3, 'P': 2, 'R': 0.0015, 'Mass': 0.205, 'S_max': 95, 'S_min': 35},
-    '4S2P 80-20': {'C': 10.0, 'S': 4, 'P': 2, 'R': 0.0015, 'Mass': 0.205, 'S_max': 80, 'S_min': 20}
+# MACROS DE CONFIGURACIÓN RÁPIDA (Solo mueven sliders)
+MACROS_CONFIGURACION = {
+    '3S2P (80-20)': {'S': 3, 'P': 2, 'S_max': 80, 'S_min': 20},
+    '3S2P (95-35)': {'S': 3, 'P': 2, 'S_max': 95, 'S_min': 35},
+    '4S2P (80-20)': {'S': 4, 'P': 2, 'S_max': 80, 'S_min': 20}
 }
 
 R_CONN_PACK = 0.0040 
@@ -181,11 +173,11 @@ def run_simulation(val=None):
     cap_pack_ah_real = cap_celda_real * n_p
     
     # Inicialización por defecto para evitar UnboundLocalError
-    r_nom_cell = 0.0015 
+    r_nom_cell = 0.002025 
     mass = 0.205
     
     if abs(cap_celda - 10.0) > 0.1:
-         r_nom_cell = 0.015 / cap_celda if cap_celda > 0 else 0.0015
+         r_nom_cell = 0.02025 / cap_celda if cap_celda > 0 else 0.002025
          mass = cap_celda * 0.0205 # La masa no cambia significativa con SOH
 
     # Factor de corrección para simulación realista + ENVEJECIMIENTO
@@ -345,17 +337,16 @@ def run_simulation(val=None):
     factor_stress_soc = 1.0 + (k_parabola * (distancia_al_centro ** 2))
 
     # E) CÁLCULO FINAL CON CALIBRACIÓN
+    # E) CÁLCULO FINAL CON CALIBRACIÓN
     if tasa_pct_base_100 is not None:
         # Fórmula Maestra: Base_IA * Ajuste_Tecnologia * Fatiga * Estrés_SOC
         deg_por_ciclo = (tasa_pct_base_100 * cap_celda) * FACTOR_AJUSTE_POUCH * factor_fatiga * factor_stress_soc
         
         metodo_usado = f"Híbrido Calibrado (DoD {dod_slider_pct}% | Factor Tech x{FACTOR_AJUSTE_POUCH})"
     else:
-        # Fallback Genérico
-        deg_base_lineal = interp1d(list(DB_DEGRADACION_BASE.keys()), list(DB_DEGRADACION_BASE.values()), fill_value="extrapolate")(c_rate_efectivo)
-        f_temp = 2.0 ** ((temp_promedio - 25.0)/10.0)
-        deg_por_ciclo = ((deg_base_lineal * cap_celda) / 2000) * f_temp * factor_fatiga * factor_stress_soc
-        metodo_usado = "Genérico Completo"
+        # Fallback si IA falla: No calculamos degradación
+        deg_por_ciclo = 0.0
+        metodo_usado = "IA no disponible"
 
     # F) Cálculo de Vida Útil
     capacidad_limite_perdida = cap_celda * 0.20
@@ -456,16 +447,20 @@ txt_res = None
 txt_vida = None 
 
 ax_radio = plt.axes([0.05, 0.70, 0.35, 0.20], facecolor='#f0f0f0')
-radio = RadioButtons(ax_radio, list(MODELOS_DB.keys()), active=0)
-def change_model(label):
-    data = MODELOS_DB[label]
-    controls[2][0].set_val(data['P'])
-    controls[1][0].set_val(data['S'])
-    controls[0][0].set_val(data['C'])
-    if 'S_max' in data: controls[3][0].set_val(data['S_max'])
-    if 'S_min' in data: controls[4][0].set_val(data['S_min'])
-radio.on_clicked(change_model)
-plt.text(0.05, 0.91, "1. SELECCIÓN DE MODELO", transform=fig.transFigure, fontsize=11, fontweight='bold', color='blue')
+radio = RadioButtons(ax_radio, list(MACROS_CONFIGURACION.keys()), active=0)
+
+def aplicar_configuracion(label):
+    macro = MACROS_CONFIGURACION[label]
+    # Mover sliders a la posición definida en la macro
+    controls[1][0].set_val(macro['S'])      # Series
+    controls[2][0].set_val(macro['P'])      # Paralelo
+    # La capacidad (controls[0]) NO se toca, es propiedad de la celda
+    
+    if 'S_max' in macro: controls[3][0].set_val(macro['S_max'])
+    if 'S_min' in macro: controls[4][0].set_val(macro['S_min'])
+
+radio.on_clicked(aplicar_configuracion)
+plt.text(0.05, 0.91, "1. CONFIGURACIÓN RÁPIDA (MACROS)", transform=fig.transFigure, fontsize=11, fontweight='bold', color='blue')
 
 ax_radio_plot = plt.axes([0.25, 0.92, 0.15, 0.06], facecolor='#e6e6e6')
 radio_plot = RadioButtons(ax_radio_plot, ['Tensión (V)', 'Intensidad (A)', 'Potencia (W)'])
@@ -544,6 +539,6 @@ class InvertedSlider(Slider):
 
 make_control('SOH Simulado (%)', 60.0, 100.0, 100.0, start_y - 8*step_y, 1, "%1.0f")
 
-change_model('3S2P 80-20')
+aplicar_configuracion('3S2P (80-20)')
 run_simulation()
 plt.show()
